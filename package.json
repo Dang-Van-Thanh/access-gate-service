@@ -1,0 +1,13 @@
+{
+  "name": "access-gate-service",
+  "version": "0.1.0",
+  "description": "",
+  "private": true,
+  "devDependencies": {
+    "@stoplight/prism-cli": "^5.10.0",
+    "@stoplight/spectral-cli": "^6.13.1",
+    "newman": "^6.2.1",
+    "newman-reporter-htmlextra": "^1.23.1",
+    "wait-on": "^8.0.1"
+  }
+}

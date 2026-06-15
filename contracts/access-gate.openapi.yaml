@@ -1,0 +1,408 @@
+openapi: 3.1.0
+info:
+  title: Smart Campus — Access Gate Service API (A3)
+  version: 1.0.1
+  description: |
+    Hợp đồng API OpenAPI 3.1 chính thức của Access Gate Service (Nhóm 3 - A3).
+
+    Service này quản lý phần cứng tại các cổng kiểm soát, tiếp nhận tín hiệu quẹt thẻ,
+    đồng bộ nhật ký truy cập và báo cáo trạng thái thiết bị cho Core Business.
+      - Endpoint /access/logs/recent cung cấp nhật ký quẹt thẻ gần đây với phân trang Cursor, hoàn toàn tương thích với Core Business.
+      - Endpoint /access/logs/{logId} cung cấp chi tiết một log truy cập, bao gồm thông tin chủ thẻ và thiết bị.
+      - Endpoint /gates/{gateId}/status báo cáo trạng thái hoạt động của cổng vật lý.
+      - Endpoint /cards/{cardId} đồng bộ thông tin thẻ từ Core Business để phục vụ việc check policy tại Edge.
+  contact:
+    name: Nhóm 3 (A3) - Lớp CNTT 17-11
+    email: team3.a3.accessgate@campus.local
+servers:
+  - url: http://localhost:4010
+    description: Prism Mock Server
+  - url: https://gate.campus.local
+    description: Production Smart Campus
+tags:
+  - name: system
+    description: Vận hành hệ thống
+  - name: access-logs
+    description: Nhật ký quẹt thẻ (dành cho Core Business)
+  - name: device-monitoring
+    description: Giám sát cổng và thẻ tại Edge
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Kiểm tra trạng thái service
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service hoạt động tốt
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: access-gate-service
+                  time:
+                    type: string
+                    format: date-time
+                    example: '2026-06-13T10:00:00Z'
+        '503':
+          description: Mất kết nối thành phần quan trọng
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /access/logs/recent:
+    get:
+      tags: [access-logs]
+      summary: Lấy danh sách log quẹt thẻ gần đây (Có phân trang Cursor)
+      description: |
+        Endpoint dành cho Core Business (Pair 03).  
+        Hỗ trợ cursor-based pagination hoàn toàn tương thích với Core Business.
+      operationId: getAccessLogsRecent
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            nullable: true
+          description: Mã cursor base64 để lấy trang tiếp theo
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Số lượng bản ghi tối đa trên một trang
+      responses:
+        '200':
+          description: Danh sách log phân trang thành công
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessLogPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /access/logs/{logId}:
+    get:
+      tags: [access-logs]
+      summary: Lấy chi tiết một access log (kèm thông tin chủ thẻ, thiết bị)
+      operationId: getAccessLogById
+      parameters:
+        - name: logId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID của log quẹt thẻ
+      responses:
+        '200':
+          description: Chi tiết log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessLogDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /gates/{gateId}/status:
+    get:
+      tags: [device-monitoring]
+      summary: Lấy trạng thái hoạt động của cổng vật lý
+      operationId: getGateStatus
+      parameters:
+        - name: gateId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^GATE-[0-9]{2}$'
+          description: Mã cổng (định dạng GATE-XX)
+      responses:
+        '200':
+          description: Trạng thái cổng
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GateStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /cards/{cardId}:
+    get:
+      tags: [device-monitoring]
+      summary: Lấy chi tiết thông tin thẻ (đồng bộ với Core Business)
+      operationId: getCardDetail
+      parameters:
+        - name: cardId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^CARD-[0-9]{6}$'
+          description: Mã thẻ (định dạng CARD-XXXXXX)
+      responses:
+        '200':
+          description: Chi tiết thẻ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CardDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT nội bộ Smart Campus
+
+  schemas:
+    AccessLog:
+      type: object
+      additionalProperties: false
+      required: [logId, cardId, gateId, direction, timestamp, status]
+      properties:
+        logId:
+          type: string
+          format: uuid
+          example: 0196fb3d-4ad7-7d1e-9f49-5d5148d2cafe
+        cardId:
+          type: string
+          pattern: '^CARD-[0-9]{6}$'
+          example: CARD-123456
+        gateId:
+          type: string
+          pattern: '^GATE-[0-9]{2}$'
+          example: GATE-01
+        direction:
+          type: string
+          enum: [IN, OUT]
+          example: IN
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-06-13T10:00:00Z'
+        status:
+          type: string
+          enum: [ALLOWED, DENIED]
+          example: ALLOWED
+        note:
+          type: [string, 'null']
+          maxLength: 300
+          description: Ghi chú bổ sung (nếu có)
+          example: Quẹt thẻ ngoài giờ quy định.
+
+    AccessLogPage:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor, hasMore]
+      properties:
+        items:
+          type: array
+          minItems: 0
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/AccessLog'
+        nextCursor:
+          type: [string, 'null']
+          description: Cursor base64 để lấy trang tiếp theo, null nếu là trang cuối
+          example: 'eyJjcmVhdGVkX2F0IjoiMjAyNi0wNi0xM1QxMDowMDowMFoiLCJpZCI6MTIzfQ=='
+        hasMore:
+          type: boolean
+          example: false
+
+    AccessLogDetail:
+      allOf:
+        - $ref: '#/components/schemas/AccessLog'
+        - type: object
+          additionalProperties: false
+          required: [holderName, holderRole, readerModel]
+          properties:
+            holderName:
+              type: string
+              minLength: 2
+              maxLength: 100
+              example: Nguyễn Văn Hưởng
+            holderRole:
+              type: string
+              enum: [STUDENT, STAFF, GUEST, CONTRACTOR]
+              example: STUDENT
+            readerModel:
+              type: string
+              minLength: 1
+              maxLength: 80
+              example: RFID-RDR-V3.2
+
+    GateStatus:
+      type: object
+      additionalProperties: false
+      required: [gateId, status, lastActivityAt, firmwareVersion]
+      properties:
+        gateId:
+          type: string
+          pattern: '^GATE-[0-9]{2}$'
+          example: GATE-01
+        status:
+          type: string
+          enum: [OPEN, CLOSED, LOCKED, FAULT]
+          description: Trạng thái cổng
+          example: CLOSED
+        lastActivityAt:
+          type: string
+          format: date-time
+          description: Lần cuối cổng có hoạt động quẹt thẻ
+          example: '2026-06-13T10:00:00Z'
+        firmwareVersion:
+          type: string
+          minLength: 1
+          maxLength: 30
+          example: gate-fw-v1.4.2
+
+    CardDetail:
+      type: object
+      additionalProperties: false
+      required: [cardId, holderName, holderRole, status, issuedAt, expiresAt]
+      properties:
+        cardId:
+          type: string
+          pattern: '^CARD-[0-9]{6}$'
+          example: CARD-123456
+        holderName:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Nguyễn Văn Hưởng
+        holderRole:
+          type: string
+          enum: [STUDENT, STAFF, GUEST, CONTRACTOR]
+          example: STUDENT
+        status:
+          type: string
+          enum: [ACTIVE, BLOCKED, EXPIRED]
+          example: ACTIVE
+        issuedAt:
+          type: string
+          format: date-time
+          example: '2025-09-01T08:00:00Z'
+        expiresAt:
+          type: string
+          format: date-time
+          example: '2029-09-01T17:00:00Z'
+
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://campus.local/errors/validation
+        title:
+          type: string
+          minLength: 3
+          maxLength: 120
+          example: Dữ liệu không hợp lệ
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          example: 400
+        detail:
+          type: [string, 'null']
+          maxLength: 500
+          example: Trường direction chỉ nhận IN hoặc OUT
+        instance:
+          type: [string, 'null']
+          format: uri
+          example: https://campus.local/access/logs/recent
+        errors:
+          type: array
+          minItems: 0
+          maxItems: 50
+          items:
+            type: object
+            required: [field, code, message]
+            properties:
+              field:
+                type: string
+                example: direction
+              code:
+                type: string
+                example: ENUM_MISMATCH
+              message:
+                type: string
+                example: Giá trị phải là 'IN' hoặc 'OUT'
+
+  responses:
+    BadRequest:
+      description: Dữ liệu gửi lên sai định dạng hoặc thiếu trường bắt buộc
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Thiếu hoặc sai JWT token
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Token không có quyền truy cập tài nguyên
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Không tìm thấy tài nguyên (logId, gateId, cardId)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalServerError:
+      description: Lỗi hệ thống nội bộ
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+# mới nhất
