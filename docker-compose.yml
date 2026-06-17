@@ -11,21 +11,38 @@ services:
     env_file:
       - .env
     environment:
-      # Các biến từ .env sẽ được nạp, nhưng có thể ghi đè hoặc bổ sung ở đây
       - CORE_SERVICE_URL=${CORE_SERVICE_URL}
       - CORE_REQUEST_TIMEOUT=${CORE_REQUEST_TIMEOUT}
+      - DATABASE_URL=postgresql://access_user:access_pass@postgres:5432/access_db
     volumes:
-      # Mount file whitelist để có thể cập nhật mà không rebuild (tuỳ chọn)
       - ./uid_whitelist.csv:/app/uid_whitelist.csv:ro
-      # Mount thư mục src nếu muốn code nóng (chỉ dùng dev, không dùng cho prod)
-      # - ./src:/app/src
+    depends_on:
+      - postgres
     restart: unless-stopped
     networks:
       - team-internal
-      # - class-net
+      - class-net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: access-db
+    environment:
+      POSTGRES_USER: access_user
+      POSTGRES_PASSWORD: access_pass
+      POSTGRES_DB: access_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - team-internal
+
+volumes:
+  postgres_data:
 
 networks:
   team-internal:
     driver: bridge
-  # class-net:
-  #   external: true
+  class-net:
+    external: true

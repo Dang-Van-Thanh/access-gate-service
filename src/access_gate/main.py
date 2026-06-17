@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 AccessGate Service – Nhận UID RFID từ HiveMQ, gọi Core Business để thẩm định quyền,
-publish kết quả granted/denied, đồng thời expose REST API cho Core Business.
+lưu log vào PostgreSQL, expose REST API cho Core Business,
+và publish sự kiện qua MQTT để Analytics có thể consume (queue async).
 """
 
 import csv
@@ -11,6 +12,7 @@ import os
 import ssl
 import threading
 import uuid
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
@@ -21,17 +23,19 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import uvicorn
 import httpx
+from databases import Database
+import sqlalchemy
 
 # ==================== DETERMINE PROJECT ROOT ====================
 _current_dir = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(_current_dir))  # go up two levels
+PROJECT_ROOT = os.path.dirname(os.path.dirname(_current_dir))
 
 # Load .env from project root
 dotenv_path = os.path.join(PROJECT_ROOT, ".env")
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
 else:
-    load_dotenv()  # fallback
+    load_dotenv()
 
 # ==================== LOAD ENV ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -48,6 +52,7 @@ MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 INPUT_TOPIC = os.getenv("INPUT_TOPIC", "smart-campus/raw/access/rfid-uid")
 OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "smart-campus/events/access")
+PUBLISH_ENABLED = os.getenv("PUBLISH_ENABLED", "true").lower() == "true"  # bật mặc định
 
 # Whitelist CSV
 WHITELIST_CSV_ENV = os.getenv("WHITELIST_CSV", "uid_whitelist.csv")
@@ -63,11 +68,43 @@ API_PORT = int(os.getenv("API_PORT", "8000"))
 # Core Business integration
 CORE_SERVICE_URL = os.getenv("CORE_SERVICE_URL", "http://localhost:8000")
 CORE_REQUEST_TIMEOUT = float(os.getenv("CORE_REQUEST_TIMEOUT", "3.0"))
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+if not AUTH_TOKEN:
+    logger.warning("AUTH_TOKEN chưa được cấu hình, gọi Core sẽ bị lỗi 401")
+
+# Database
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./access_logs.db")
+database = Database(DATABASE_URL)
+metadata = sqlalchemy.MetaData()
+
+# Define table
+access_log_table = sqlalchemy.Table(
+    "access_logs",
+    metadata,
+    sqlalchemy.Column("logId", sqlalchemy.String(36), primary_key=True),
+    sqlalchemy.Column("cardId", sqlalchemy.String(50), index=True),
+    sqlalchemy.Column("gateId", sqlalchemy.String(20), index=True),
+    sqlalchemy.Column("direction", sqlalchemy.String(10)),
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime(timezone=True), index=True),
+    sqlalchemy.Column("status", sqlalchemy.String(20), index=True),
+    sqlalchemy.Column("note", sqlalchemy.String(300), nullable=True),
+    sqlalchemy.Column("holderName", sqlalchemy.String(100)),
+    sqlalchemy.Column("holderRole", sqlalchemy.String(30)),
+    sqlalchemy.Column("readerModel", sqlalchemy.String(80)),
+    sqlalchemy.Column("reason", sqlalchemy.String(100), nullable=True),
+)
+
+# Create tables
+engine = sqlalchemy.create_engine(DATABASE_URL)
+metadata.create_all(engine)
 
 # ==================== GLOBAL DATA STORES ====================
-access_logs = []  # list of dict
+access_logs = []  # RAM cache, tối đa 200
 MAX_LOG_SIZE = 200
-whitelist: Dict[str, dict] = {}  # uid -> student info
+whitelist: Dict[str, dict] = {}
+
+# Queue for async DB insert
+log_queue = asyncio.Queue()
 
 # ==================== HELPER FUNCTIONS ====================
 def load_whitelist(csv_path: str) -> Dict[str, dict]:
@@ -94,8 +131,7 @@ def load_whitelist(csv_path: str) -> Dict[str, dict]:
 def generate_event_id() -> str:
     return f"access-event-{uuid.uuid4().hex[:12]}"
 
-def store_access_log(processed: dict):
-    # Xử lý cardId an toàn
+def build_log_entry(processed: dict) -> dict:
     card_id = processed.get("cardId")
     if not card_id:
         student_id = processed.get('student_id')
@@ -103,32 +139,26 @@ def store_access_log(processed: dict):
             card_id = f"CARD-{student_id[-6:]}"
         else:
             card_id = "CARD-UNKNOWN"
-    
+
     holder_name = processed.get("full_name") or "Unknown"
     holder_role = "STUDENT" if processed.get("student_id") else "GUEST"
     reader_model = "RFID-RDR-V3.2"
 
-    log_entry = {
+    return {
         "logId": str(uuid.uuid4()),
         "cardId": card_id,
         "gateId": processed.get("door_id", "GATE-01"),
         "direction": processed.get("direction", "IN"),
-        "timestamp": processed.get("timestamp", datetime.now(timezone.utc).isoformat()),
+        "timestamp": datetime.fromisoformat(processed.get("timestamp", datetime.now(timezone.utc).isoformat())),
         "status": "ALLOWED" if processed.get("access_result") == "granted" else "DENIED",
         "note": processed.get("reason", ""),
         "holderName": holder_name,
         "holderRole": holder_role,
-        "readerModel": reader_model
+        "readerModel": reader_model,
+        "reason": processed.get("reason"),
     }
-    access_logs.insert(0, log_entry)
-    if len(access_logs) > MAX_LOG_SIZE:
-        access_logs.pop()
 
 def call_core_policy(card_id: str, gate_id: str, direction: str, timestamp: str) -> Optional[dict]:
-    """
-    Gọi POST /access/check của Core Business.
-    Trả về dict chứa 'allow' (bool) và các trường khác, hoặc None nếu lỗi/timeout.
-    """
     request_id = str(uuid.uuid4())
     payload = {
         "requestId": request_id,
@@ -137,10 +167,14 @@ def call_core_policy(card_id: str, gate_id: str, direction: str, timestamp: str)
         "direction": direction,
         "timestamp": timestamp
     }
+    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
     try:
-        # Sử dụng httpx.Client trong context manager (sync)
         with httpx.Client(timeout=CORE_REQUEST_TIMEOUT) as client:
-            resp = client.post(f"{CORE_SERVICE_URL}/access/check", json=payload)
+            resp = client.post(
+                f"{CORE_SERVICE_URL}/access/check",
+                json=payload,
+                headers=headers
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 logger.debug(f"Core response: {data}")
@@ -163,7 +197,6 @@ def enrich_output(raw_payload: dict) -> dict:
     direction = raw_payload.get("direction", "unknown")
     timestamp = raw_payload.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-    # Lấy thông tin từ whitelist local (nếu có)
     student_id = None
     full_name = None
     class_name = None
@@ -175,11 +208,9 @@ def enrich_output(raw_payload: dict) -> dict:
         class_name = info["class_name"]
         card_id = f"CARD-{student_id[-6:]}"
 
-    # Gọi Core Business để thẩm định quyền
     core_decision = call_core_policy(card_id, door_id, direction, timestamp)
 
     if core_decision is not None:
-        # Core trả lời thành công
         if core_decision.get("allow") is True:
             access_result = "granted"
             reason = f"policy_{core_decision.get('reasonCode', 'ALLOWED')}"
@@ -187,7 +218,6 @@ def enrich_output(raw_payload: dict) -> dict:
             access_result = "denied"
             reason = f"policy_{core_decision.get('reasonCode', 'DENIED')}"
     else:
-        # Fallback: Core không phản hồi → từ chối để an toàn
         logger.warning(f"Core không phản hồi, từ chối UID {uid} (card {card_id})")
         access_result = "denied"
         reason = "core_unavailable"
@@ -211,11 +241,24 @@ def enrich_output(raw_payload: dict) -> dict:
         "reason": reason,
         "cardId": card_id
     }
-    store_access_log(output)
     return output
+
+# ==================== DB BACKGROUND WORKER ====================
+async def log_worker():
+    """Liên tục lấy log từ queue và insert vào DB."""
+    while True:
+        log_entry = await log_queue.get()
+        try:
+            query = access_log_table.insert().values(**log_entry)
+            await database.execute(query)
+        except Exception as e:
+            logger.exception(f"Lỗi insert log vào DB: {e}")
+        finally:
+            log_queue.task_done()
 
 # ==================== MQTT CALLBACKS ====================
 mqtt_client = None
+loop = None  # sẽ được set trong lifespan
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
@@ -239,13 +282,28 @@ def on_message(client, userdata, msg):
         logger.warning(f"Thiếu field bắt buộc: {missing} - payload: {raw_payload}")
         return
 
+    # Xử lý nghiệp vụ
     output = enrich_output(raw_payload)
 
-    result = mqtt_client.publish(OUTPUT_TOPIC, payload=json.dumps(output, ensure_ascii=False), qos=1)
-    if result.rc == mqtt.MQTT_ERR_SUCCESS:
-        logger.info(f"Đã publish tới {OUTPUT_TOPIC}: {output['access_result']} - UID {output['uid']}")
+    # Lưu vào RAM cache (sync)
+    log_entry = build_log_entry(output)
+    access_logs.insert(0, log_entry)
+    if len(access_logs) > MAX_LOG_SIZE:
+        access_logs.pop()
+
+    # Gửi vào queue để insert DB (nếu DB đã kết nối)
+    if loop and database.is_connected:
+        asyncio.run_coroutine_threadsafe(log_queue.put(log_entry), loop)
     else:
-        logger.error(f"Publish thất bại, mã lỗi: {result.rc}")
+        logger.warning("Database chưa sẵn sàng, log chỉ lưu RAM")
+
+    # Publish sự kiện để Analytics consume (queue async qua MQTT)
+    if PUBLISH_ENABLED:
+        result = mqtt_client.publish(OUTPUT_TOPIC, payload=json.dumps(output, ensure_ascii=False), qos=1)
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            logger.info(f"Đã publish tới {OUTPUT_TOPIC}: {output['access_result']} - UID {output['uid']}")
+        else:
+            logger.error(f"Publish thất bại, mã lỗi: {result.rc}")
 
     logger.debug(f"Output: {json.dumps(output, indent=2, ensure_ascii=False)}")
 
@@ -300,14 +358,33 @@ class CardDetail(BaseModel):
 # ==================== FASTAPI APP ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global loop
+    loop = asyncio.get_running_loop()
+
+    # Kết nối DB
+    await database.connect()
+    logger.info("Đã kết nối database")
+
+    # Khởi tạo worker xử lý log queue
+    worker_task = asyncio.create_task(log_worker())
+
+    # Start MQTT thread
+    mqtt_thread = threading.Thread(target=run_mqtt, daemon=True)
+    mqtt_thread.start()
+
     yield
+
+    # Shutdown
+    worker_task.cancel()
+    await database.disconnect()
     if mqtt_client:
         mqtt_client.disconnect()
+        mqtt_client.loop_stop()
 
 app = FastAPI(
     title="Access Gate Service",
     version="1.0.0",
-    description="Smart Campus Access Gate - MQTT + REST API",
+    description="Smart Campus Access Gate - MQTT + REST API + PostgreSQL",
     lifespan=lifespan
 )
 
@@ -369,9 +446,6 @@ def main():
     whitelist = load_whitelist(WHITELIST_CSV)
     if not whitelist:
         logger.warning("Whitelist rỗng, mọi UID sẽ bị từ chối!")
-
-    mqtt_thread = threading.Thread(target=run_mqtt, daemon=True)
-    mqtt_thread.start()
 
     run_api()
 

@@ -39,6 +39,8 @@ LOG_LEVEL=INFO
 
 ## 2. Chạy service bằng Python thuần (phát triển)
 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
 ```bash
 # Bước 1: Tạo và kích hoạt virtual environment (khuyến nghị)
 python -m venv venv

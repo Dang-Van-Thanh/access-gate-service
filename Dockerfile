@@ -23,6 +23,9 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/opt/venv/bin:$PATH"
 
+# --- THÊM DÒNG NÀY ĐỂ CÀI CURL ---
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 # Biến môi trường mặc định (có thể override bằng .env hoặc compose)
 ENV API_HOST=0.0.0.0
 ENV API_PORT=8000
@@ -38,9 +41,7 @@ RUN addgroup --system appgroup \
 COPY --from=builder /opt/venv /opt/venv
 
 # Copy toàn bộ mã nguồn (giữ nguyên cấu trúc thư mục)
-# Lưu ý: chỉ copy những gì cần thiết, có thể dùng .dockerignore để loại trừ
 COPY src/ ./src/
-# Copy file whitelist và .env mẫu (nếu cần) – thực tế .env sẽ được mount hoặc truyền biến
 COPY uid_whitelist.csv ./
 
 # Cấp quyền cho user
