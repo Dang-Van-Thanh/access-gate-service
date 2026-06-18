@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-AccessGate Service – Nhận UID RFID từ HiveMQ, gọi Core Business để thẩm định quyền,
-lưu log vào PostgreSQL, expose REST API cho Core Business,
-và publish sự kiện qua MQTT để Analytics có thể consume (queue async).
+AccessGate Service – Nhận UID RFID từ HiveMQ, kiểm tra whitelist trước,
+gọi Core Business để thẩm định quyền (chỉ với UID đã có trong whitelist),
+lưu log vào PostgreSQL, expose REST API,
+và publish sự kiện qua MQTT để Analytics consume.
 """
 
 import csv
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import uuid
@@ -52,7 +54,7 @@ MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 INPUT_TOPIC = os.getenv("INPUT_TOPIC", "smart-campus/raw/access/rfid-uid")
 OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "smart-campus/events/access")
-PUBLISH_ENABLED = os.getenv("PUBLISH_ENABLED", "true").lower() == "true"  # bật mặc định
+PUBLISH_ENABLED = os.getenv("PUBLISH_ENABLED", "true").lower() == "true"
 
 # Whitelist CSV
 WHITELIST_CSV_ENV = os.getenv("WHITELIST_CSV", "uid_whitelist.csv")
@@ -107,6 +109,19 @@ whitelist: Dict[str, dict] = {}
 log_queue = asyncio.Queue()
 
 # ==================== HELPER FUNCTIONS ====================
+def _make_card_id(value: str) -> str:
+    """
+    Tạo cardId hợp lệ theo pattern ^CARD-[0-9]{6}$
+    từ một chuỗi bất kỳ (student_id, UID, ...).
+    Lấy tối đa 6 chữ số cuối, bổ sung số 0 phía trước nếu thiếu.
+    """
+    digits = re.sub(r'\D', '', value)
+    if digits:
+        suffix = digits[-6:].zfill(6)
+    else:
+        suffix = "000000"
+    return f"CARD-{suffix}"
+
 def load_whitelist(csv_path: str) -> Dict[str, dict]:
     data = {}
     if not os.path.exists(csv_path):
@@ -132,24 +147,44 @@ def generate_event_id() -> str:
     return f"access-event-{uuid.uuid4().hex[:12]}"
 
 def build_log_entry(processed: dict) -> dict:
+    """
+    Tạo bản ghi log từ dữ liệu đã xử lý.
+    processed chứa các trường: cardId, door_id, direction, timestamp,
+    access_result, reason, full_name, student_id, ...
+    """
     card_id = processed.get("cardId")
     if not card_id:
         student_id = processed.get('student_id')
-        if student_id and isinstance(student_id, str):
-            card_id = f"CARD-{student_id[-6:]}"
+        if student_id:
+            card_id = _make_card_id(student_id)
         else:
-            card_id = "CARD-UNKNOWN"
+            uid = processed.get('uid', '')
+            card_id = _make_card_id(uid) if uid else "CARD-000000"
 
     holder_name = processed.get("full_name") or "Unknown"
     holder_role = "STUDENT" if processed.get("student_id") else "GUEST"
     reader_model = "RFID-RDR-V3.2"
+
+    # Lấy timestamp từ processed (đã là datetime) hoặc tạo mới
+    timestamp_raw = processed.get("timestamp")
+    if timestamp_raw:
+        try:
+            ts = datetime.fromisoformat(timestamp_raw.replace('Z', '+00:00'))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
+        except Exception:
+            ts = datetime.now(timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc)
 
     return {
         "logId": str(uuid.uuid4()),
         "cardId": card_id,
         "gateId": processed.get("door_id", "GATE-01"),
         "direction": processed.get("direction", "IN"),
-        "timestamp": datetime.fromisoformat(processed.get("timestamp", datetime.now(timezone.utc).isoformat())),
+        "timestamp": ts,   # lưu datetime
         "status": "ALLOWED" if processed.get("access_result") == "granted" else "DENIED",
         "note": processed.get("reason", ""),
         "holderName": holder_name,
@@ -159,12 +194,18 @@ def build_log_entry(processed: dict) -> dict:
     }
 
 def call_core_policy(card_id: str, gate_id: str, direction: str, timestamp: str) -> Optional[dict]:
+    """Gọi Core Business với direction đã được chuẩn hóa."""
+    normalized_direction = direction.upper()
+    if normalized_direction not in ("IN", "OUT"):
+        logger.warning(f"Direction '{direction}' không hợp lệ, mặc định 'IN'")
+        normalized_direction = "IN"
+
     request_id = str(uuid.uuid4())
     payload = {
         "requestId": request_id,
         "cardId": card_id,
         "gateId": gate_id,
-        "direction": direction,
+        "direction": normalized_direction,
         "timestamp": timestamp
     }
     headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
@@ -197,32 +238,47 @@ def enrich_output(raw_payload: dict) -> dict:
     direction = raw_payload.get("direction", "unknown")
     timestamp = raw_payload.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-    student_id = None
-    full_name = None
-    class_name = None
-    card_id = "CARD-UNKNOWN"
-    if uid in whitelist:
+    # --- Kiểm tra whitelist trước ---
+    if uid not in whitelist:
+        # Không có trong whitelist → từ chối ngay
+        access_result = "denied"
+        reason = "uid_not_in_whitelist"
+        student_id = None
+        full_name = None
+        class_name = None
+        card_id = _make_card_id(uid)
+    else:
+        # Có trong whitelist, lấy thông tin
         info = whitelist[uid]
         student_id = info["student_id"]
         full_name = info["full_name"]
         class_name = info["class_name"]
-        card_id = f"CARD-{student_id[-6:]}"
+        card_id = _make_card_id(student_id) if student_id else _make_card_id(uid)
 
-    core_decision = call_core_policy(card_id, door_id, direction, timestamp)
+        # Gọi Core để áp dụng chính sách bổ sung
+        core_decision = call_core_policy(card_id, door_id, direction, timestamp)
 
-    if core_decision is not None:
-        if core_decision.get("allow") is True:
-            access_result = "granted"
-            reason = f"policy_{core_decision.get('reasonCode', 'ALLOWED')}"
+        if core_decision is not None:
+            if core_decision.get("allow") is True:
+                access_result = "granted"
+                reason = f"policy_{core_decision.get('reasonCode', 'ALLOWED')}"
+            else:
+                access_result = "denied"
+                reason = f"policy_{core_decision.get('reasonCode', 'DENIED')}"
         else:
             access_result = "denied"
-            reason = f"policy_{core_decision.get('reasonCode', 'DENIED')}"
-    else:
-        logger.warning(f"Core không phản hồi, từ chối UID {uid} (card {card_id})")
-        access_result = "denied"
-        reason = "core_unavailable"
+            reason = "core_unavailable"
 
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    # Chuẩn hóa timestamp sang UTC với 'Z'
+    try:
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        now_iso = dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    except Exception:
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     output = {
         "event_id": generate_event_id(),
@@ -258,7 +314,7 @@ async def log_worker():
 
 # ==================== MQTT CALLBACKS ====================
 mqtt_client = None
-loop = None  # sẽ được set trong lifespan
+loop = None
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
@@ -282,22 +338,17 @@ def on_message(client, userdata, msg):
         logger.warning(f"Thiếu field bắt buộc: {missing} - payload: {raw_payload}")
         return
 
-    # Xử lý nghiệp vụ
     output = enrich_output(raw_payload)
-
-    # Lưu vào RAM cache (sync)
     log_entry = build_log_entry(output)
     access_logs.insert(0, log_entry)
     if len(access_logs) > MAX_LOG_SIZE:
         access_logs.pop()
 
-    # Gửi vào queue để insert DB (nếu DB đã kết nối)
     if loop and database.is_connected:
         asyncio.run_coroutine_threadsafe(log_queue.put(log_entry), loop)
     else:
         logger.warning("Database chưa sẵn sàng, log chỉ lưu RAM")
 
-    # Publish sự kiện để Analytics consume (queue async qua MQTT)
     if PUBLISH_ENABLED:
         result = mqtt_client.publish(OUTPUT_TOPIC, payload=json.dumps(output, ensure_ascii=False), qos=1)
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
@@ -327,7 +378,7 @@ class AccessLog(BaseModel):
     cardId: str
     gateId: str
     direction: str
-    timestamp: str
+    timestamp: datetime   # đã sửa thành datetime
     status: str
     note: Optional[str] = None
 
@@ -361,20 +412,16 @@ async def lifespan(app: FastAPI):
     global loop
     loop = asyncio.get_running_loop()
 
-    # Kết nối DB
     await database.connect()
     logger.info("Đã kết nối database")
 
-    # Khởi tạo worker xử lý log queue
     worker_task = asyncio.create_task(log_worker())
 
-    # Start MQTT thread
     mqtt_thread = threading.Thread(target=run_mqtt, daemon=True)
     mqtt_thread.start()
 
     yield
 
-    # Shutdown
     worker_task.cancel()
     await database.disconnect()
     if mqtt_client:
@@ -446,7 +493,6 @@ def main():
     whitelist = load_whitelist(WHITELIST_CSV)
     if not whitelist:
         logger.warning("Whitelist rỗng, mọi UID sẽ bị từ chối!")
-
     run_api()
 
 if __name__ == "__main__":

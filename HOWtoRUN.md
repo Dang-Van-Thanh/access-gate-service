@@ -81,7 +81,7 @@ Mở terminal khác (hoặc dùng curl/PowerShell) và gọi:
 
 ```bash
 # Health check
-curl http://localhost:8000/health
+curl http://localhost:8000/health #curl http://26.51.14.74:8000/health
 
 # Lấy 5 log gần nhất
 curl http://localhost:8000/access/logs/recent?limit=5 -o logs.json
@@ -113,4 +113,19 @@ Chạy bằng Docker:
 docker compose down
 # Chỉ dừng container, không xóa
 docker compose stop
+```
+
+## 7. Database 
+
+```bash
+
+# Kiểm tra danh sách bảng
+docker exec -it access-db psql -U access_user -d access_db -c "\dt"
+
+# Kiểm tra cấu trúc bảng
+docker exec -it access-db psql -U access_user -d access_db -c "\d access_logs"
+
+# Truy vấn dữ liệu từ psql tương tác
+docker exec -it access-db psql -U access_user -d access_db
+SELECT "logId", "cardId", status, timestamp FROM access_logs ORDER BY timestamp DESC LIMIT 5;
 ```
