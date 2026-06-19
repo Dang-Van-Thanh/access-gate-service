@@ -1,0 +1,8 @@
+$body = @{
+    cardId   = "CARD-000003"
+    gateId   = "GATE-A"
+    direction = "IN"
+    timestamp = "2026-06-19T14:30:10+07:00"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8000/access/check" -Method Post -Body $body -ContentType "application/json"

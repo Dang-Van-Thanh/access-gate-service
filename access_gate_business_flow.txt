@@ -1,0 +1,99 @@
+======================================================================
+ACCESS GATE SERVICE – NGHIỆP VỤ VÀ LUỒNG XỬ LÝ
+======================================================================
+
+1. GIỚI THIỆU
+- Service đóng vai trò "người gác cổng", quản lý việc ra vào tại các cổng vật lý.
+- Nhận dữ liệu thô (UID RFID) từ MQTT, kiểm tra whitelist, quyết định cho phép/từ chối,
+  làm giàu danh tính và publish sự kiện đã xử lý.
+- Cung cấp REST API cho Core Business để kiểm tra quyền realtime.
+
+2. CÁC LUỒNG NGHIỆP VỤ CHÍNH
+----------------------------------------------------------------------
+A. LUỒNG XỬ LÝ QUẸT THỜI GIAN THỰC (MQTT)
+   Bước 1:  Nhận payload thô từ topic raw
+            smart-campus/raw/access/rfid-uid
+   Bước 2:  VALIDATE – kiểm tra đủ trường bắt buộc
+            (event_id, event_type, timestamp, uid, door_id, direction)
+            Nếu thiếu → log lỗi, kết thúc.
+   Bước 3:  LOOKUP + DECIDE – tra cứu uid trong whitelist
+            - Có: access_result = "granted", reason = "uid_matched"
+            - Không: access_result = "denied", reason = "uid_not_in_whitelist"
+   Bước 4:  ENRICH – bổ sung thông tin sinh viên
+            - Nếu granted: student_id, full_name, class_name từ whitelist
+            - Nếu denied: các trường để null
+            - Tạo cardId chuẩn CARD-XXXXXX
+   Bước 5:  Lưu log vào RAM cache và hàng đợi PostgreSQL
+            - RAM cache (tối đa 200 bản ghi) phục vụ truy vấn nhanh
+            - Hàng đợi async để insert vào PostgreSQL
+   Bước 6:  PRODUCE – publish sự kiện đã xử lý lên topic events
+            smart-campus/events/access
+            (Analytics, Core Business sẽ tiêu thụ)
+
+B. LUỒNG CORE BUSINESS GỌI REST KIỂM TRA QUYỀN (ĐỒNG BỘ)
+   Bước 1:  Core gửi POST /access/check với payload:
+            { "cardId": "CARD-123456", "gateId": "GATE-01", "direction": "IN", "timestamp": "..." }
+   Bước 2:  Tra cứu cardId trong ánh xạ card_to_uid
+   Bước 3:  Áp dụng cùng logic quyết định (dựa trên uid)
+   Bước 4:  Trả về response JSON:
+            {
+              "allowed": true/false,
+              "reason": "...",
+              "student_id": "...",
+              "full_name": "...",
+              "class_name": "...",
+              "cardId": "CARD-..."
+            }
+
+C. LUỒNG NỀN GHI LOG VÀO POSTGRESQL
+   - Worker chạy ngầm (log_worker) liên tục lấy log từ queue và insert vào DB.
+   - Nếu DB lỗi, log vẫn được giữ trong RAM tạm thời, service không crash.
+
+3. CÁC THÀNH PHẦN CHÍNH
+- Whitelist: file uid_whitelist.csv (load vào RAM khi khởi động)
+- Ánh xạ card_to_uid: hỗ trợ tra cứu ngược từ cardId -> uid
+- Database PostgreSQL: lưu trữ vĩnh viễn log truy cập
+- MQTT Broker: nhận raw và publish sự kiện
+- REST API: FastAPI endpoints
+
+4. QUY TẮC NGHIỆP VỤ
+- UID có trong whitelist → granted, bổ sung đầy đủ thông tin.
+- UID không có trong whitelist → denied, thông tin null.
+- Mọi lượt quẹt đều được ghi log (cả granted và denied).
+- Không gọi Core Business để hỏi ý kiến (quyết định tại biên).
+
+5. SƠ ĐỒ LUỒNG (XEM FILE .png hoặc .svg từ Mermaid)
+
+flowchart TD
+    A([Bắt đầu: Nhận MQTT raw]) --> B{"VALIDATE: Kiểm tra<br/>đủ trường bắt buộc?"}
+    B -- "Thiếu" --> C([Ghi lỗi, kết thúc])
+    B -- "Đủ" --> D[Trích xuất uid, door_id, direction, timestamp]
+    
+    D --> E{"LOOKUP: uid có trong<br/>whitelist?"}
+    E -- "Có" --> F["Quyết định: access_result = granted<br/>reason = uid_matched"]
+    E -- "Không" --> G["Quyết định: access_result = denied<br/>reason = uid_not_in_whitelist"]
+    
+    F --> H["ENRICH: Lấy student_id, full_name, class_name"]
+    G --> I["ENRICH: student_id, full_name, class_name = null"]
+    
+    H --> J["Tạo cardId chuẩn CARD-XXXXXX"]
+    I --> J
+    J --> K[Lưu log vào RAM cache]
+    K --> L[Đưa log vào hàng đợi PostgreSQL]
+    L --> M["PRODUCE: Publish sự kiện đã xử lý lên topic events"]
+    M --> N([Kết thúc luồng MQTT])
+
+    O([Core Business gọi REST POST /access/check]) --> P["Nhận payload {cardId, gateId, direction, timestamp}"]
+    P --> Q[Tra cứu cardId -> uid qua card_to_uid]
+    Q --> R{"uid có tồn tại?"}
+    R -- "Có" --> S[Gọi hàm decide_access_uid]
+    R -- "Không" --> T["Trả về denied, reason = card_not_in_whitelist"]
+    S --> U["Trả về response với allowed, reason, thông tin"]
+    T --> U
+    U --> V([Kết thúc luồng REST])
+
+    W[Worker nền log_worker] --> X[Lấy log từ hàng đợi]
+    X --> Y[Insert vào PostgreSQL]
+    Y --> Z{"Ghi thành công?"}
+    Z -- "Thành công" --> AA[Đánh dấu đã xử lý]
+    Z -- "Thất bại" --> AB[Ghi lỗi, tiếp tục vòng lặp]

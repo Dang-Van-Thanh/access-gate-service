@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AccessGate Service – Nhận UID RFID từ HiveMQ, kiểm tra whitelist trước,
-gọi Core Business để thẩm định quyền (chỉ với UID đã có trong whitelist),
-lưu log vào PostgreSQL, expose REST API,
-và publish sự kiện qua MQTT để Analytics consume.
+AccessGate Service – Nhận UID RFID từ HiveMQ, kiểm tra whitelist,
+gọi REST API cho Core Business kiểm tra quyền, lưu log vào PostgreSQL,
+expose REST API, và publish sự kiện qua MQTT để Analytics consume.
 """
 
 import csv
@@ -21,7 +20,7 @@ from contextlib import asynccontextmanager
 
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from pydantic import BaseModel
 import uvicorn
 import httpx
@@ -67,12 +66,11 @@ else:
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
-# Core Business integration
+# Core Business integration (chỉ dùng cho gọi Core khi cần, nhưng hiện tại không dùng)
+# Vẫn giữ biến môi trường nhưng không sử dụng trong logic chính
 CORE_SERVICE_URL = os.getenv("CORE_SERVICE_URL", "http://localhost:8000")
 CORE_REQUEST_TIMEOUT = float(os.getenv("CORE_REQUEST_TIMEOUT", "3.0"))
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
-if not AUTH_TOKEN:
-    logger.warning("AUTH_TOKEN chưa được cấu hình, gọi Core sẽ bị lỗi 401")
 
 # Database
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./access_logs.db")
@@ -103,7 +101,8 @@ metadata.create_all(engine)
 # ==================== GLOBAL DATA STORES ====================
 access_logs = []  # RAM cache, tối đa 200
 MAX_LOG_SIZE = 200
-whitelist: Dict[str, dict] = {}
+whitelist: Dict[str, dict] = {}      # uid -> {student_id, full_name, class_name}
+card_to_uid: Dict[str, str] = {}     # cardId (CARD-xxxxxx) -> uid
 
 # Queue for async DB insert
 log_queue = asyncio.Queue()
@@ -122,29 +121,95 @@ def _make_card_id(value: str) -> str:
         suffix = "000000"
     return f"CARD-{suffix}"
 
-def load_whitelist(csv_path: str) -> Dict[str, dict]:
+def load_whitelist(csv_path: str):
+    """Đọc whitelist và xây dựng ánh xạ uid -> info, cardId -> uid."""
+    global whitelist, card_to_uid
     data = {}
+    card_map = {}
     if not os.path.exists(csv_path):
         logger.error(f"Không tìm thấy file whitelist: {csv_path}")
-        return data
+        whitelist = data
+        card_to_uid = card_map
+        return
     try:
         with open(csv_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 uid = row.get("uid", "").strip()
                 if uid:
+                    student_id = row.get("student_id", "").strip()
+                    full_name = row.get("full_name", "").strip()
+                    class_name = row.get("class_name", "").strip()
                     data[uid] = {
-                        "student_id": row.get("student_id", "").strip(),
-                        "full_name": row.get("full_name", "").strip(),
-                        "class_name": row.get("class_name", "").strip(),
+                        "student_id": student_id,
+                        "full_name": full_name,
+                        "class_name": class_name,
                     }
-        logger.info(f"Đã tải {len(data)} UID từ {csv_path}")
+                    # Tạo cardId từ student_id (ưu tiên) hoặc từ uid nếu student_id rỗng
+                    card_id = _make_card_id(student_id) if student_id else _make_card_id(uid)
+                    card_map[card_id] = uid
+        whitelist = data
+        card_to_uid = card_map
+        logger.info(f"Đã tải {len(data)} UID từ {csv_path}, {len(card_map)} thẻ.")
     except Exception as e:
         logger.exception(f"Lỗi đọc file CSV: {e}")
-    return data
+        whitelist = {}
+        card_to_uid = {}
 
 def generate_event_id() -> str:
     return f"access-event-{uuid.uuid4().hex[:12]}"
+
+# --- CHANGED: Hàm quyết định dùng chung, không gọi Core ---
+def decide_access(uid: str, door_id: str, direction: str, timestamp: str) -> dict:
+    """
+    Quyết định cho phép/từ chối dựa trên whitelist.
+    Trả về dict với các trường:
+        access_result: 'granted' hoặc 'denied'
+        reason: lý do
+        student_id: str hoặc None
+        full_name: str hoặc None
+        class_name: str hoặc None
+        cardId: str
+    """
+    if uid not in whitelist:
+        return {
+            "access_result": "denied",
+            "reason": "uid_not_in_whitelist",
+            "student_id": None,
+            "full_name": None,
+            "class_name": None,
+            "cardId": _make_card_id(uid)
+        }
+    info = whitelist[uid]
+    student_id = info["student_id"]
+    full_name = info["full_name"]
+    class_name = info["class_name"]
+    card_id = _make_card_id(student_id) if student_id else _make_card_id(uid)
+    # Có thể bổ sung các policy khác ở đây (giờ giấc, khu vực,...)
+    # nhưng yêu cầu cơ bản chỉ cần whitelist
+    return {
+        "access_result": "granted",
+        "reason": "uid_matched",
+        "student_id": student_id,
+        "full_name": full_name,
+        "class_name": class_name,
+        "cardId": card_id
+    }
+
+def decide_access_by_card(card_id: str, door_id: str, direction: str, timestamp: str) -> dict:
+    """Tra cứu theo cardId, chuyển sang uid rồi gọi decide_access."""
+    uid = card_to_uid.get(card_id)
+    if uid is None:
+        # Không tìm thấy cardId trong whitelist
+        return {
+            "access_result": "denied",
+            "reason": "card_not_in_whitelist",
+            "student_id": None,
+            "full_name": None,
+            "class_name": None,
+            "cardId": card_id
+        }
+    return decide_access(uid, door_id, direction, timestamp)
 
 def build_log_entry(processed: dict) -> dict:
     """
@@ -193,43 +258,7 @@ def build_log_entry(processed: dict) -> dict:
         "reason": processed.get("reason"),
     }
 
-def call_core_policy(card_id: str, gate_id: str, direction: str, timestamp: str) -> Optional[dict]:
-    """Gọi Core Business với direction đã được chuẩn hóa."""
-    normalized_direction = direction.upper()
-    if normalized_direction not in ("IN", "OUT"):
-        logger.warning(f"Direction '{direction}' không hợp lệ, mặc định 'IN'")
-        normalized_direction = "IN"
-
-    request_id = str(uuid.uuid4())
-    payload = {
-        "requestId": request_id,
-        "cardId": card_id,
-        "gateId": gate_id,
-        "direction": normalized_direction,
-        "timestamp": timestamp
-    }
-    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"} if AUTH_TOKEN else {}
-    try:
-        with httpx.Client(timeout=CORE_REQUEST_TIMEOUT) as client:
-            resp = client.post(
-                f"{CORE_SERVICE_URL}/access/check",
-                json=payload,
-                headers=headers
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                logger.debug(f"Core response: {data}")
-                return data
-            else:
-                logger.error(f"Core trả về lỗi {resp.status_code}: {resp.text}")
-                return None
-    except httpx.TimeoutException:
-        logger.error("Core service timeout (%.1fs)", CORE_REQUEST_TIMEOUT)
-        return None
-    except Exception as e:
-        logger.exception(f"Lỗi khi gọi Core: {e}")
-        return None
-
+# --- CHANGED: Bỏ gọi Core, dùng decide_access ---
 def enrich_output(raw_payload: dict) -> dict:
     raw_event_id = raw_payload.get("event_id")
     uid = raw_payload.get("uid", "").strip()
@@ -238,36 +267,13 @@ def enrich_output(raw_payload: dict) -> dict:
     direction = raw_payload.get("direction", "unknown")
     timestamp = raw_payload.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-    # --- Kiểm tra whitelist trước ---
-    if uid not in whitelist:
-        # Không có trong whitelist → từ chối ngay
-        access_result = "denied"
-        reason = "uid_not_in_whitelist"
-        student_id = None
-        full_name = None
-        class_name = None
-        card_id = _make_card_id(uid)
-    else:
-        # Có trong whitelist, lấy thông tin
-        info = whitelist[uid]
-        student_id = info["student_id"]
-        full_name = info["full_name"]
-        class_name = info["class_name"]
-        card_id = _make_card_id(student_id) if student_id else _make_card_id(uid)
-
-        # Gọi Core để áp dụng chính sách bổ sung
-        core_decision = call_core_policy(card_id, door_id, direction, timestamp)
-
-        if core_decision is not None:
-            if core_decision.get("allow") is True:
-                access_result = "granted"
-                reason = f"policy_{core_decision.get('reasonCode', 'ALLOWED')}"
-            else:
-                access_result = "denied"
-                reason = f"policy_{core_decision.get('reasonCode', 'DENIED')}"
-        else:
-            access_result = "denied"
-            reason = "core_unavailable"
+    decision = decide_access(uid, door_id, direction, timestamp)
+    access_result = decision["access_result"]
+    reason = decision["reason"]
+    student_id = decision["student_id"]
+    full_name = decision["full_name"]
+    class_name = decision["class_name"]
+    card_id = decision["cardId"]
 
     # Chuẩn hóa timestamp sang UTC với 'Z'
     try:
@@ -378,7 +384,7 @@ class AccessLog(BaseModel):
     cardId: str
     gateId: str
     direction: str
-    timestamp: datetime   # đã sửa thành datetime
+    timestamp: datetime
     status: str
     note: Optional[str] = None
 
@@ -405,6 +411,21 @@ class CardDetail(BaseModel):
     status: str
     issuedAt: str
     expiresAt: str
+
+# --- CHANGED: Models cho endpoint /access/check ---
+class AccessCheckRequest(BaseModel):
+    cardId: str
+    gateId: str
+    direction: str
+    timestamp: str
+
+class AccessCheckResponse(BaseModel):
+    allowed: bool
+    reason: str
+    student_id: Optional[str] = None
+    full_name: Optional[str] = None
+    class_name: Optional[str] = None
+    cardId: str
 
 # ==================== FASTAPI APP ====================
 @asynccontextmanager
@@ -471,26 +492,44 @@ async def get_gate_status(gateId: str):
 async def get_card_detail(cardId: str):
     if not cardId.startswith("CARD-"):
         raise HTTPException(status_code=400, detail="Invalid cardId format")
-    suffix = cardId[5:]
-    for uid, info in whitelist.items():
-        if info["student_id"].endswith(suffix):
-            return CardDetail(
-                cardId=cardId,
-                holderName=info["full_name"],
-                holderRole="STUDENT",
-                status="ACTIVE",
-                issuedAt="2025-09-01T08:00:00Z",
-                expiresAt="2029-09-01T17:00:00Z"
-            )
-    raise HTTPException(status_code=404, detail="Card not found")
+    # Tìm uid từ cardId
+    uid = card_to_uid.get(cardId)
+    if uid is None:
+        raise HTTPException(status_code=404, detail="Card not found")
+    info = whitelist.get(uid)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Card not found")
+    return CardDetail(
+        cardId=cardId,
+        holderName=info["full_name"],
+        holderRole="STUDENT" if info["student_id"] else "GUEST",
+        status="ACTIVE",
+        issuedAt="2025-09-01T08:00:00Z",
+        expiresAt="2029-09-01T17:00:00Z"
+    )
+
+# --- CHANGED: Endpoint mới cho Core Business kiểm tra quyền ---
+@app.post("/access/check", response_model=AccessCheckResponse, tags=["core-integration"])
+async def check_access(request: AccessCheckRequest):
+    """
+    Endpoint dành cho Core Business gọi để kiểm tra quyền ra/vào theo thời gian thực.
+    """
+    decision = decide_access_by_card(request.cardId, request.gateId, request.direction, request.timestamp)
+    return AccessCheckResponse(
+        allowed=(decision["access_result"] == "granted"),
+        reason=decision["reason"],
+        student_id=decision["student_id"],
+        full_name=decision["full_name"],
+        class_name=decision["class_name"],
+        cardId=decision["cardId"]
+    )
 
 def run_api():
     uvicorn.run(app, host=API_HOST, port=API_PORT)
 
 # ==================== MAIN ====================
 def main():
-    global whitelist
-    whitelist = load_whitelist(WHITELIST_CSV)
+    load_whitelist(WHITELIST_CSV)
     if not whitelist:
         logger.warning("Whitelist rỗng, mọi UID sẽ bị từ chối!")
     run_api()
