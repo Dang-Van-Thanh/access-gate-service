@@ -231,13 +231,14 @@ async def process_swipe(raw_payload: dict):
     # 2. Tạo cardId từ UID
     card_id = _make_card_id(uid)
 
-    # 3. Kiểm tra whitelist trước
+    # 3. Kiểm tra whitelist và gọi Core
     info = whitelist.get(uid)
     if info:
+        # Lấy thông tin từ whitelist (tạm giữ)
         student_id = info.get("student_id")
         full_name = info.get("full_name")
         class_name = info.get("class_name")
-        # UID hợp lệ → gọi Core để kiểm tra policy
+        # Gọi Core để kiểm tra policy
         core_decision = await call_core_policy(card_id, door_id, direction, timestamp)
         allow = core_decision["allow"]
         core_reason = core_decision["reason"]
@@ -245,12 +246,19 @@ async def process_swipe(raw_payload: dict):
         if allow:
             access_result = "granted"
             reason = core_reason
+            # Giữ nguyên thông tin (granted → có thông tin)
         else:
             access_result = "denied"
             reason = core_reason
+            # 🔴 BẮT BUỘC: khi denied, thông tin sinh viên phải là null
+            student_id = None
+            full_name = None
+            class_name = None
     else:
-        # UID không có trong whitelist → từ chối ngay, không gọi Core
-        student_id = full_name = class_name = None
+        # UID không có trong whitelist → denied, không gọi Core
+        student_id = None
+        full_name = None
+        class_name = None
         access_result = "denied"
         reason = "uid_not_in_whitelist"
         logger.warning(f"UID {uid} không có trong whitelist, từ chối")
