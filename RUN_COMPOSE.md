@@ -81,7 +81,7 @@ Mở terminal khác (hoặc dùng curl/PowerShell) và gọi:
 
 ```bash
 # Health check
-curl http://localhost:8000/health #curl http://26.51.14.74:8000/health
+curl http://localhost:8000/health #curl http://26.137.61.149:8000/health   curl http://26.14.39.52:8000/health  
 
 # Lấy 5 log gần nhất
 curl http://localhost:8000/access/logs/recent?limit=5 -o logs.json

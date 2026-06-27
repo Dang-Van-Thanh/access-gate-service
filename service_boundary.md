@@ -66,6 +66,7 @@
 | Method | Endpoint | Mục đích |
 |---|---|---|
 | GET | `/health` | Kiểm tra trạng thái hoạt động của service |
+| POST| `/access/check` | Kiểm tra policy ra/vào realtime |
 | GET | `/access/logs/{logId}` | Truy vấn chi tiết một log theo ID |
 | GET | `/access/logs/recent` | Truy vấn danh sách log ra/vào gần đây |
 | GET | `/gates/{gateId}/status` | Truy vấn trạng thái hiện tại của một cổng cụ thể |
